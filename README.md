@@ -26,7 +26,7 @@ wetransfer up ./photos -p random -e 7d
 
 ## Install
 
-Go 1.24 or newer is required. There are no runtime dependencies.
+Go 1.25 or newer is required. There are no runtime dependencies.
 
 ```bash
 git clone https://github.com/byt7s/wetransfer.git
