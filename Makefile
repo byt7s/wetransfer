@@ -1,5 +1,5 @@
 BINARY  ?= wetransfer
-VERSION ?= $(shell git describe --tags --dirty 2>/dev/null || echo 0.3.0)
+VERSION ?= $(shell git describe --tags --dirty 2>/dev/null || echo 1.0.0)
 LDFLAGS := -X wetransfer/internal/version.Label=$(VERSION)
 
 .PHONY: build test vet install dist clean

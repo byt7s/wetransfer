@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.3.0-007aff" alt="Version" />
+  <img src="https://img.shields.io/badge/version-1.0.0-007aff" alt="Version" />
   <img src="https://img.shields.io/badge/macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-007aff" alt="macOS, Linux and Windows" />
   <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/byt7s/wetransfer?color=007aff" alt="Go version" /></a>
 </p>
@@ -221,8 +221,8 @@ internal/zipx       folder packing
 A tag that starts with `v` builds the six archives and publishes them with `SHA256SUMS`.
 
 ```bash
-git tag v0.3.0
-git push origin v0.3.0
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 ## Disclaimer

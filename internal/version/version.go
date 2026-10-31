@@ -10,7 +10,7 @@ import (
 )
 
 // Label is replaced with -ldflags "-X wetransfer/internal/version.Label=v1.2.3".
-var Label = "0.3.0"
+var Label = "1.0.0"
 
 func Print() {
 	fmt.Println(Current())

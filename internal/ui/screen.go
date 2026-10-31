@@ -7,13 +7,35 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/term"
 )
 
-// Screen is a full-screen alternate buffer for uploads and downloads.
-// It is a no-op unless enabled (stderr is a terminal and the run is not
-// silent).
+const (
+	ansiReset  = "\033[0m"
+	ansiBold   = "\033[1m"
+	ansiDim    = "\033[2m"
+	ansiCyan   = "\033[36m"
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
+)
+
+type StepState int
+
+const (
+	StepPending StepState = iota
+	StepCurrent
+	StepDone
+)
+
+type Step struct {
+	Label string
+	State StepState
+}
+
+// Screen is a full-screen alternate buffer for uploads and downloads. It is a
+// no-op unless enabled (stderr is a terminal and the run is not silent).
 type Screen struct {
 	out     io.Writer
 	enabled bool
@@ -22,10 +44,12 @@ type Screen struct {
 	section string
 	phase   string
 	label   string
+	steps   []Step
 	done    int64
 	total   int64
 	speed   float64
 	eta     time.Duration
+	start   time.Time
 	entered bool
 }
 
@@ -47,6 +71,7 @@ func (s *Screen) Enter() {
 	}
 	fmt.Fprint(s.out, "\033[?1049h\033[?25l\033[2J\033[H")
 	s.entered = true
+	s.start = time.Now()
 	s.drawLocked()
 }
 
@@ -78,6 +103,25 @@ func (s *Screen) SetPhase(phase string) {
 	s.mu.Unlock()
 }
 
+func (s *Screen) SetSteps(steps []Step) {
+	s.mu.Lock()
+	s.steps = append([]Step(nil), steps...)
+	s.drawLocked()
+	s.mu.Unlock()
+}
+
+// ClearProgress resets the bar when one phase ends and another begins.
+func (s *Screen) ClearProgress() {
+	s.mu.Lock()
+	s.label = ""
+	s.done = 0
+	s.total = 0
+	s.speed = 0
+	s.eta = 0
+	s.drawLocked()
+	s.mu.Unlock()
+}
+
 func (s *Screen) SetProgress(label string, done, total int64, speed float64, eta time.Duration) {
 	s.mu.Lock()
 	s.label = label
@@ -93,63 +137,78 @@ func (s *Screen) drawLocked() {
 	if !s.enabled || !s.entered {
 		return
 	}
-	width := 80
-	if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w > 0 {
-		width = w
-	}
-	if width < 40 {
-		width = 40
-	}
-	if width > 100 {
-		width = 100
-	}
+	width := contentWidth(os.Stderr)
 
 	var b strings.Builder
 	b.WriteString("\033[H")
-	writeLine(&b, "\033[1;34mwetransfer\033[0m")
-	writeLine(&b, "\033[2m"+strings.Repeat("─", width-2)+"\033[0m")
 	writeLine(&b, "")
-	if s.section != "" {
-		writeLine(&b, "\033[1m"+s.section+"\033[0m")
+	writeLine(&b, "  "+tone(ansiBold+ansiCyan, "wetransfer"))
+	writeLine(&b, "  "+tone(ansiDim, strings.Repeat("─", width)))
+	writeLine(&b, "")
+
+	for _, step := range s.steps {
+		switch step.State {
+		case StepDone:
+			writeLine(&b, "  "+tone(ansiGreen, "✓")+"  "+tone(ansiDim, clipRunes(step.Label, width-4)))
+		case StepCurrent:
+			writeLine(&b, "  "+tone(ansiBold+ansiCyan, "▸")+"  "+tone(ansiBold, clipRunes(step.Label, width-4)))
+		default:
+			writeLine(&b, "  "+tone(ansiDim, "·")+"  "+tone(ansiDim, clipRunes(step.Label, width-4)))
+		}
 	}
-	if s.phase != "" {
-		writeLine(&b, s.phase)
+	if len(s.steps) > 0 {
+		writeLine(&b, "")
+	}
+
+	if s.section != "" {
+		writeLine(&b, "  "+tone(ansiBold, clipRunes(s.section, width)))
+	}
+	detail := s.phase
+	if s.label != "" && !strings.EqualFold(s.label, s.phase) {
+		if detail != "" {
+			detail += "  ·  "
+		}
+		detail += s.label
+	}
+	if detail != "" {
+		writeLine(&b, "  "+tone(ansiDim, clipRunes(detail, width)))
 	}
 
 	if s.total > 0 {
-		pct := float64(s.done) / float64(s.total)
-		if pct > 1 {
-			pct = 1
+		pct := float64(s.done) / float64(s.total) * 100
+		if pct > 100 {
+			pct = 100
 		}
-		barWidth := width - 32
-		if barWidth < 12 {
-			barWidth = 12
+		filled := int((float64(width) * pct / 100) + 0.5)
+		if filled <= 0 && pct > 0 {
+			filled = 1
 		}
-		if barWidth > 48 {
-			barWidth = 48
+		if filled > width {
+			filled = width
 		}
-		filled := int(pct * float64(barWidth))
-		bar := "\033[34m" + strings.Repeat("█", filled) + "\033[0m" +
-			"\033[2m" + strings.Repeat("░", barWidth-filled) + "\033[0m"
-		line := fmt.Sprintf("[%s] %3.0f%%", bar, pct*100)
+		bar := tone(ansiCyan, strings.Repeat("█", filled)) + tone(ansiDim, strings.Repeat("░", width-filled))
+		writeLine(&b, "")
+		writeLine(&b, "  "+bar)
+		writeLine(&b, "")
+		writeLine(&b, "  "+tone(ansiBold, fmt.Sprintf("%.0f%%", pct))+"   "+
+			FormatBytes(s.done)+" of "+FormatBytes(s.total))
+		speed := "--"
 		if s.speed > 0 {
-			line += fmt.Sprintf("  %s/s", FormatBytes(int64(s.speed)))
+			speed = FormatBytes(int64(s.speed)) + "/s"
 		}
-		if s.eta > 0 && s.done < s.total {
-			line += "  ETA " + FormatClock(s.eta)
+		eta := "--"
+		if s.eta > 0 {
+			eta = FormatClock(s.eta) + " left"
 		}
-		writeLine(&b, line)
-		stats := fmt.Sprintf("%s of %s", FormatBytes(s.done), FormatBytes(s.total))
-		if s.label != "" {
-			stats += "  ·  " + s.label
-		}
-		writeLine(&b, stats)
-	} else if s.label != "" {
-		writeLine(&b, s.label)
+		stats := speed + "   ·   " + eta + "   ·   " + FormatClock(time.Since(s.start))
+		writeLine(&b, "  "+tone(ansiDim, clipRunes(stats, width)))
+	} else if s.done > 0 {
+		writeLine(&b, "")
+		writeLine(&b, "  "+FormatBytes(s.done))
 	}
 
-	b.WriteString("\r\n")
-	writeLine(&b, "\033[2mctrl+c cancel\033[0m")
+	writeLine(&b, "")
+	writeLine(&b, "  "+tone(ansiBold, "ctrl+c")+" "+tone(ansiDim, "cancel"))
 	b.WriteString("\033[J")
 	fmt.Fprint(s.out, b.String())
 }
@@ -157,4 +216,43 @@ func (s *Screen) drawLocked() {
 func writeLine(b *strings.Builder, line string) {
 	b.WriteString(line)
 	b.WriteString("\033[K\r\n")
+}
+
+func contentWidth(f *os.File) int {
+	width, _, err := term.GetSize(int(f.Fd()))
+	if err != nil || width < 24 {
+		width = 80
+	}
+	width -= 4
+	if width > 68 {
+		width = 68
+	}
+	if width < 20 {
+		width = 20
+	}
+	return width
+}
+
+func tone(code, text string) string {
+	if text == "" {
+		return ""
+	}
+	if os.Getenv("NO_COLOR") != "" {
+		return text
+	}
+	return code + text + ansiReset
+}
+
+func clipRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	if n == 1 {
+		return "…"
+	}
+	return string(r[:n-1]) + "…"
 }

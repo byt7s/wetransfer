@@ -282,13 +282,18 @@ func Download(ctx context.Context, opts DownloadOptions) ([]DownloadedFile, erro
 	screen := ui.NewScreen(opts.Err, progressOn)
 	screen.SetSection("Download")
 	screen.SetPhase("Downloading")
+	screen.SetSteps([]ui.Step{
+		{Label: "Transfer", State: ui.StepDone},
+		{Label: "Files", State: ui.StepDone},
+		{Label: "Download", State: ui.StepCurrent},
+	})
 	if progressOn {
 		screen.Enter()
 		defer screen.Exit()
 	}
 	bar := ui.NewProgress(total, progressOn, opts.Err)
 	bar.SetScreen(screen)
-	bar.SetLabel(fmt.Sprintf("downloading 0/%d", len(jobs)))
+	bar.SetLabel(fmt.Sprintf("0/%d files", len(jobs)))
 	bar.Start()
 
 	results := make([]DownloadedFile, len(jobs))
@@ -312,7 +317,7 @@ func Download(ctx context.Context, opts DownloadOptions) ([]DownloadedFile, erro
 		results[i] = DownloadedFile{Name: filepath.Base(j.dst), Path: j.dst, Size: j.item.Size}
 		mu.Lock()
 		done++
-		label := fmt.Sprintf("downloading %d/%d", done, len(jobs))
+		label := fmt.Sprintf("%d/%d files", done, len(jobs))
 		mu.Unlock()
 		bar.SetLabel(label)
 		if progressOn {
@@ -327,6 +332,13 @@ func Download(ctx context.Context, opts DownloadOptions) ([]DownloadedFile, erro
 			maybeDeleteParts(jobs, opts)
 		}
 		return nil, err
+	}
+	if progressOn {
+		screen.SetSteps([]ui.Step{
+			{Label: "Transfer", State: ui.StepDone},
+			{Label: "Files", State: ui.StepDone},
+			{Label: "Download", State: ui.StepDone},
+		})
 	}
 	return results, nil
 }

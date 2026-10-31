@@ -82,6 +82,11 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 	progressOn := !opts.Silent && ui.IsTerminal(os.Stderr)
 	screen := ui.NewScreen(opts.Err, progressOn)
 	screen.SetSection("Upload")
+	screen.SetSteps([]ui.Step{
+		{Label: "Prepare", State: ui.StepCurrent},
+		{Label: "Upload", State: ui.StepPending},
+		{Label: "Finish", State: ui.StepPending},
+	})
 	if progressOn {
 		screen.Enter()
 		defer screen.Exit()
@@ -171,6 +176,16 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 		}
 	}
 
+	if progressOn {
+		screen.ClearProgress()
+		screen.SetSteps([]ui.Step{
+			{Label: "Prepare", State: ui.StepDone},
+			{Label: "Upload", State: ui.StepCurrent},
+			{Label: "Finish", State: ui.StepPending},
+		})
+	}
+	status("Starting upload…")
+
 	items := make([]api.PreflightItem, 0, len(files))
 	for _, f := range files {
 		sizes := make([]int64, len(f.chunks))
@@ -208,7 +223,7 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 		}
 		up := ui.NewProgress(total, progressOn, opts.Err)
 		up.SetScreen(screen)
-		up.SetLabel(fmt.Sprintf("uploading 0/%d", len(jobs)))
+		up.SetLabel(fmt.Sprintf("0/%d blocks", len(jobs)))
 		up.Start()
 		var done int
 		var mu sync.Mutex
@@ -237,7 +252,7 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 					watch.Mark()
 					mu.Lock()
 					done++
-					label := fmt.Sprintf("uploading %d/%d", done, len(jobs))
+					label := fmt.Sprintf("%d/%d blocks", done, len(jobs))
 					mu.Unlock()
 					up.SetLabel(label)
 					if progressOn {
@@ -293,6 +308,14 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 		}
 		batch = append(batch, api.BatchItem{Path: f.name, BlockIDs: ids})
 	}
+	if progressOn {
+		screen.ClearProgress()
+		screen.SetSteps([]ui.Step{
+			{Label: "Prepare", State: ui.StepDone},
+			{Label: "Upload", State: ui.StepDone},
+			{Label: "Finish", State: ui.StepCurrent},
+		})
+	}
 	status("Finishing upload…")
 	if err := completeBatch(ctx, client, claims, tr.StormUploadToken, batch); err != nil {
 		return fail(fmt.Errorf("finalize blocks: %w", err))
@@ -302,6 +325,13 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 	final, err := consolidate(ctx, client, tr.ID, tr.MutationToken)
 	if err != nil {
 		return fail(fmt.Errorf("finalize transfer: %w", err))
+	}
+	if progressOn {
+		screen.SetSteps([]ui.Step{
+			{Label: "Prepare", State: ui.StepDone},
+			{Label: "Upload", State: ui.StepDone},
+			{Label: "Finish", State: ui.StepDone},
+		})
 	}
 	created = false
 	res := &UploadResult{Transfer: final}
