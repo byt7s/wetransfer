@@ -58,6 +58,9 @@ func (e *stormError) Error() string {
 	return fmt.Sprintf("storm http %d", e.Status)
 }
 
+// StatusCode lets retry classify HTTP failures.
+func (e *stormError) StatusCode() int { return e.Status }
+
 // BatchPendingError means the blocks were uploaded but S3 has not finished
 // processing them yet. The caller should retry CompleteBatch.
 type BatchPendingError struct {

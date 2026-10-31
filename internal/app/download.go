@@ -10,9 +10,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"wetransfer/internal/api"
+	"wetransfer/internal/retry"
 	"wetransfer/internal/ui"
 )
 
@@ -284,9 +286,19 @@ func Download(ctx context.Context, opts DownloadOptions) ([]DownloadedFile, erro
 	results := make([]DownloadedFile, len(jobs))
 	var done int
 	var mu sync.Mutex
+	var waitOnce sync.Once
+	onWait := func() {
+		waitOnce.Do(func() {
+			if progressOn {
+				bar.SetLabel("connection lost — retrying…")
+			} else if opts.Err != nil {
+				fmt.Fprintln(opts.Err, retry.WaitNotice)
+			}
+		})
+	}
 	err = parallel(ctx, opts.Concurrency, len(jobs), func(i int) error {
 		j := &jobs[i]
-		if err := downloadOne(ctx, client, ref, pwd, j, bar.Add); err != nil {
+		if err := downloadOne(ctx, client, ref, pwd, j, bar.Add, onWait); err != nil {
 			return err
 		}
 		results[i] = DownloadedFile{Name: filepath.Base(j.dst), Path: j.dst, Size: j.item.Size}
@@ -320,14 +332,14 @@ func streamToStdout(ctx context.Context, client *api.Client, ref *Ref, pwd strin
 		return nil, err
 	}
 	req.Header.Set("User-Agent", api.UserAgent)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, &api.Error{Status: resp.StatusCode, Message: strings.TrimSpace(string(body))}
 	}
 	n, err := io.Copy(out, resp.Body)
 	if err != nil {
@@ -359,40 +371,51 @@ func signLink(ctx context.Context, client *api.Client, ref *Ref, pwd string, ite
 			return url, nil
 		}
 		last = err
+		if !retry.IsTemporary(err) {
+			return "", err
+		}
 	}
 	return "", last
 }
 
-func downloadOne(ctx context.Context, client *api.Client, ref *Ref, pwd string, j *downloadJob, onWrite func(int64)) error {
-	var last error
-	for attempt := 0; attempt < 4; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
-			}
-		}
+func downloadOne(ctx context.Context, client *api.Client, ref *Ref, pwd string, j *downloadJob, onWrite func(int64), onWait func()) error {
+	watch := retry.NewWatch()
+	delay := watch.Step()
+	for {
 		url, err := signLink(ctx, client, ref, pwd, j.item)
 		if err != nil {
-			last = fmt.Errorf("sign download: %w", err)
-			continue
+			if !retry.IsTemporary(err) {
+				return fmt.Errorf("download %s: %w", j.item.Name, err)
+			}
+		} else {
+			// A failed attempt leaves its bytes in dst.part, so the next one
+			// resumes with a Range request instead of starting over.
+			err = fetchToFile(ctx, client.HTTP, url, j.dst, j.item.Size, onWrite)
+			if err == nil {
+				watch.Mark()
+				return nil
+			}
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return ctx.Err()
+			}
+			if !retry.IsTemporary(err) {
+				return fmt.Errorf("download %s: %w", j.item.Name, err)
+			}
 		}
-		// A failed attempt leaves its bytes in dst.part, so the next one
-		// resumes with a Range request instead of starting over.
-		err = fetchToFile(ctx, url, j.dst, j.item.Size, onWrite)
-		if err == nil {
-			return nil
+		if err := watch.Arm(); err != nil {
+			return fmt.Errorf("download %s: %w", j.item.Name, err)
 		}
-		last = err
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return ctx.Err()
+		if onWait != nil {
+			onWait()
 		}
+		if err := retry.Sleep(ctx, delay); err != nil {
+			return err
+		}
+		delay = retry.Next(delay, watch.Cap())
 	}
-	return fmt.Errorf("download %s: %w", j.item.Name, last)
 }
 
-func fetchToFile(ctx context.Context, url, dst string, size int64, onWrite func(int64)) error {
+func fetchToFile(ctx context.Context, hc *http.Client, url, dst string, size int64, onWrite func(int64)) error {
 	part := dst + ".part"
 
 	offset := int64(0)
@@ -421,11 +444,15 @@ func fetchToFile(ctx context.Context, url, dst string, size int64, onWrite func(
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
-	resp, err := http.DefaultClient.Do(req)
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	body := newIdleReader(resp.Body, 60*time.Second)
+	defer body.Close()
 
 	switch {
 	case resp.StatusCode == http.StatusPartialContent:
@@ -434,8 +461,8 @@ func fetchToFile(ctx context.Context, url, dst string, size int64, onWrite func(
 	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && size > 0 && offset == size:
 		return os.Rename(part, dst)
 	default:
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		msg, _ := io.ReadAll(io.LimitReader(body, 512))
+		return &api.Error{Status: resp.StatusCode, Message: strings.TrimSpace(string(msg))}
 	}
 
 	flags := os.O_CREATE | os.O_WRONLY
@@ -449,7 +476,7 @@ func fetchToFile(ctx context.Context, url, dst string, size int64, onWrite func(
 		return err
 	}
 	w := &countingWriter{w: f, on: onWrite}
-	_, copyErr := io.CopyBuffer(w, resp.Body, make([]byte, 256<<10))
+	_, copyErr := io.CopyBuffer(w, body, make([]byte, 256<<10))
 	closeErr := f.Close()
 	if copyErr != nil {
 		return copyErr
@@ -458,9 +485,47 @@ func fetchToFile(ctx context.Context, url, dst string, size int64, onWrite func(
 		return closeErr
 	}
 	if size > 0 && offset+w.n != size {
-		return fmt.Errorf("incomplete file: %d of %d bytes", offset+w.n, size)
+		return retry.IncompleteError{Got: offset + w.n, Want: size}
 	}
 	return os.Rename(part, dst)
+}
+
+// idleReader aborts a download when no bytes arrive for d. Closing the body
+// unblocks the pending Read; the retry loop then resumes from the .part file.
+type idleReader struct {
+	rc       io.ReadCloser
+	timeout  time.Duration
+	timer    *time.Timer
+	timedOut atomic.Bool
+}
+
+func newIdleReader(rc io.ReadCloser, d time.Duration) *idleReader {
+	r := &idleReader{rc: rc, timeout: d}
+	r.timer = time.AfterFunc(d, func() {
+		r.timedOut.Store(true)
+		_ = rc.Close()
+	})
+	return r
+}
+
+func (r *idleReader) Read(p []byte) (int, error) {
+	n, err := r.rc.Read(p)
+	if err != nil {
+		if r.timedOut.Load() {
+			return n, retry.ErrStalled
+		}
+		return n, err
+	}
+	if r.timedOut.Load() {
+		return n, retry.ErrStalled
+	}
+	r.timer.Reset(r.timeout)
+	return n, nil
+}
+
+func (r *idleReader) Close() error {
+	r.timer.Stop()
+	return r.rc.Close()
 }
 
 type countingWriter struct {

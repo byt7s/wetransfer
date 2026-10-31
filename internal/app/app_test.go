@@ -4,9 +4,14 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"wetransfer/internal/retry"
 )
 
 func TestSafeName(t *testing.T) {
@@ -89,6 +94,18 @@ func TestResolveRecipientURL(t *testing.T) {
 	}
 }
 
+func TestDefaultTitle(t *testing.T) {
+	if got := defaultTitle([]uploadFile{{name: "hello.txt"}}); got != "hello.txt" {
+		t.Errorf("single file title = %q", got)
+	}
+	if got := defaultTitle([]uploadFile{{name: "photos.zip", packed: true}}); got != "photos" {
+		t.Errorf("folder title = %q", got)
+	}
+	if got := defaultTitle([]uploadFile{{name: "a.txt"}, {name: "b.txt"}}); got != "Transfer" {
+		t.Errorf("multi title = %q", got)
+	}
+}
+
 func TestPlanChunks(t *testing.T) {
 	cases := []struct {
 		size   int64
@@ -143,6 +160,39 @@ func TestHashChunks(t *testing.T) {
 	if chunks[0].md5 != hex.EncodeToString(sum[:]) {
 		t.Errorf("md5 = %s", chunks[0].md5)
 	}
+}
+
+func TestIdleReader(t *testing.T) {
+	rc := &blockingReadCloser{ch: make(chan struct{})}
+	r := newIdleReader(rc, 20*time.Millisecond)
+	defer r.Close()
+
+	start := time.Now()
+	_, err := r.Read(make([]byte, 16))
+	if !errors.Is(err, retry.ErrStalled) {
+		t.Fatalf("Read = %v, want ErrStalled", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("idle timeout took %v", elapsed)
+	}
+}
+
+type blockingReadCloser struct {
+	ch chan struct{}
+}
+
+func (b *blockingReadCloser) Read([]byte) (int, error) {
+	<-b.ch
+	return 0, io.EOF
+}
+
+func (b *blockingReadCloser) Close() error {
+	select {
+	case <-b.ch:
+	default:
+		close(b.ch)
+	}
+	return nil
 }
 
 func TestParallelStopsOnError(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"strings"
@@ -43,6 +44,9 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("http %d", e.Status)
 }
 
+// StatusCode lets retry classify HTTP failures.
+func (e *Error) StatusCode() int { return e.Status }
+
 // Client is a small JSON client with a cookie jar and a browser user agent.
 type Client struct {
 	HTTP    *http.Client
@@ -54,7 +58,10 @@ func New(verbose bool) *Client {
 	jar, _ := cookiejar.New(nil)
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.MaxIdleConns = 32
-	tr.MaxIdleConnsPerHost = 16
+	tr.MaxIdleConnsPerHost = 8
+	tr.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	tr.TLSHandshakeTimeout = 10 * time.Second
+	tr.ResponseHeaderTimeout = 30 * time.Second
 	return &Client{
 		HTTP:    &http.Client{Jar: jar, Transport: tr},
 		Verbose: verbose,

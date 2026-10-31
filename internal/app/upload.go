@@ -10,11 +10,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"wetransfer/internal/api"
 	"wetransfer/internal/config"
+	"wetransfer/internal/retry"
 	"wetransfer/internal/ui"
 	"wetransfer/internal/zipx"
 )
@@ -40,6 +42,7 @@ type uploadFile struct {
 	path   string
 	name   string
 	size   int64
+	packed bool
 	chunks []uploadChunk
 }
 
@@ -74,7 +77,7 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 		return nil, errors.New("no files to send")
 	}
 	if opts.Concurrency < 1 {
-		opts.Concurrency = 4
+		opts.Concurrency = 8
 	}
 	progressOn := !opts.Silent && ui.IsTerminal(os.Stderr)
 
@@ -101,13 +104,17 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 	client := api.New(opts.Verbose)
 	client.Log = opts.Err
 
+	title := strings.TrimSpace(opts.Title)
+	if title == "" {
+		title = defaultTitle(files)
+	}
 	if !opts.Silent {
 		fmt.Fprintf(opts.Err, "Creating transfer (%d file%s, %s)…\n", len(files), plural(len(files)), ui.FormatBytes(total))
 	}
 	tr, err := client.Create(ctx, api.CreateOptions{
 		Files:        metas,
 		Message:      opts.Message,
-		Title:        opts.Title,
+		Title:        title,
 		Password:     opts.Password,
 		Expiry:       opts.Expiry,
 		DomainUserID: newUUID(),
@@ -185,23 +192,29 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 		up.Start()
 		var done int
 		var mu sync.Mutex
+		var waitOnce sync.Once
+		notifyWait := func() {
+			waitOnce.Do(func() {
+				if progressOn {
+					up.SetLabel("connection lost — retrying…")
+				} else if opts.Err != nil {
+					fmt.Fprintln(opts.Err, retry.WaitNotice)
+				}
+			})
+		}
 		err = parallel(ctx, opts.Concurrency, len(jobs), func(i int) error {
 			j := &jobs[i]
-			var lastErr error
-			for attempt := 0; attempt < 4; attempt++ {
-				if attempt > 0 {
-					select {
-					case <-ctx.Done():
-						return ctx.Err()
-					case <-time.After(time.Duration(attempt) * time.Second):
-					}
-				}
+			watch := retry.NewWatch()
+			delay := watch.Step()
+			reannounce := 0
+			for {
 				var sent int64
 				err := client.PutBlockRange(ctx, j.chunk.block, j.file.path, j.chunk.offset, j.chunk.size, func(n int64) {
 					sent += n
 					up.Add(n)
 				})
 				if err == nil {
+					watch.Mark()
 					mu.Lock()
 					done++
 					up.SetLabel(fmt.Sprintf("uploading %d/%d", done, len(jobs)))
@@ -213,19 +226,34 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 				if sent > 0 {
 					up.Rewind(sent)
 				}
-				lastErr = err
 				if errors.Is(ctx.Err(), context.Canceled) {
 					return ctx.Err()
 				}
 				// A presigned URL that expired mid-upload gets a fresh block.
 				if code, ok := api.StatusCode(err); ok && code == 403 {
+					reannounce++
+					if reannounce > 3 {
+						return fmt.Errorf("upload %s (block %d): %w", j.file.name, j.chunk.offset/uploadBlockSize+1, err)
+					}
 					fresh, rerr := announceOne(ctx, client, claims, tr.StormUploadToken, j.chunk.size, j.chunk.md5)
 					if rerr == nil {
 						j.chunk.block = fresh
+						continue
 					}
+					err = rerr
 				}
+				if !retry.IsTemporary(err) {
+					return fmt.Errorf("upload %s (block %d): %w", j.file.name, j.chunk.offset/uploadBlockSize+1, err)
+				}
+				if err := watch.Arm(); err != nil {
+					return fmt.Errorf("upload %s (block %d): %w", j.file.name, j.chunk.offset/uploadBlockSize+1, err)
+				}
+				notifyWait()
+				if err := retry.Sleep(ctx, delay); err != nil {
+					return err
+				}
+				delay = retry.Next(delay, watch.Cap())
 			}
-			return fmt.Errorf("upload %s (block %d): %w", j.file.name, j.chunk.offset/uploadBlockSize+1, lastErr)
 		})
 		up.Stop()
 		if err != nil {
@@ -258,6 +286,17 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 		res.Files = append(res.Files, UploadedFile{Name: f.name, Size: f.size})
 	}
 	return res, nil
+}
+
+func defaultTitle(files []uploadFile) string {
+	if len(files) == 1 {
+		name := files[0].name
+		if files[0].packed {
+			name = strings.TrimSuffix(name, ".zip")
+		}
+		return name
+	}
+	return "Transfer"
 }
 
 func planChunks(size int64) []uploadChunk {
@@ -314,33 +353,35 @@ func announceOne(ctx context.Context, client *api.Client, claims *api.StormClaim
 }
 
 func completeBatch(ctx context.Context, client *api.Client, claims *api.StormClaims, token string, items []api.BatchItem) error {
+	deadline := time.Now().Add(12 * time.Minute)
 	delay := time.Second
 	var last error
-	for attempt := 0; attempt < 30; attempt++ {
+	for {
 		err := client.CompleteBatch(ctx, claims, token, items)
 		if err == nil {
 			return nil
 		}
 		var pending *api.BatchPendingError
-		if !errors.As(err, &pending) {
+		if !errors.As(err, &pending) && !retry.IsTemporary(err) {
 			return err
 		}
 		last = err
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay):
+		if time.Now().After(deadline) {
+			return fmt.Errorf("gave up finalizing blocks after 12m: %w", last)
+		}
+		if err := retry.Sleep(ctx, delay); err != nil {
+			return err
 		}
 		if delay < 5*time.Second {
 			delay += 500 * time.Millisecond
 		}
 	}
-	return fmt.Errorf("blocks never finished processing: %w", last)
 }
 
 func consolidate(ctx context.Context, client *api.Client, id, mutation string) (*api.Transfer, error) {
-	var last error
-	for attempt := 0; attempt < 6; attempt++ {
+	watch := retry.NewWatch()
+	delay := watch.Step()
+	for {
 		tr, err := client.Consolidate(ctx, id, mutation)
 		if err == nil {
 			if tr.State == "downloadable" || tr.State == "processing" {
@@ -348,14 +389,17 @@ func consolidate(ctx context.Context, client *api.Client, id, mutation string) (
 			}
 			return tr, nil
 		}
-		last = err
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(time.Duration(attempt+1) * time.Second):
+		if !retry.IsTemporary(err) {
+			return nil, err
 		}
+		if err := watch.Arm(); err != nil {
+			return nil, err
+		}
+		if err := retry.Sleep(ctx, delay); err != nil {
+			return nil, err
+		}
+		delay = retry.Next(delay, watch.Cap())
 	}
-	return nil, last
 }
 
 func waitDownloadable(ctx context.Context, client *api.Client, tr *api.Transfer) (*api.Transfer, error) {
@@ -426,7 +470,7 @@ func collectFiles(ctx context.Context, opts UploadOptions) ([]uploadFile, func()
 			if !opts.Silent {
 				fmt.Fprintf(opts.Err, "Packed %s (%d files, %s)\n", name, res.Files, ui.FormatBytes(res.Size))
 			}
-			files = append(files, uploadFile{path: res.Path, name: name, size: res.Size})
+			files = append(files, uploadFile{path: res.Path, name: name, size: res.Size, packed: true})
 			seen[name] = p
 		case info.Mode().IsRegular():
 			name := filepath.Base(p)

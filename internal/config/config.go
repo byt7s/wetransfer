@@ -97,7 +97,7 @@ func (c Config) PasswordValue() (password string, generated bool, err error) {
 	case "", "none":
 		return "", false, nil
 	case "random":
-		p, err := RandomPassword(12)
+		p, err := RandomPassword(16)
 		return p, true, err
 	default:
 		return c.Password, false, nil

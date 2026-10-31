@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.0-007aff" alt="Version" />
+  <img src="https://img.shields.io/badge/version-0.3.0-007aff" alt="Version" />
   <img src="https://img.shields.io/badge/macOS%20%C2%B7%20Linux-007aff" alt="macOS and Linux" />
   <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/byt7s/wetransfer?color=007aff" alt="Go version" /></a>
 </p>
@@ -18,7 +18,7 @@ wetransfer up ./photos -p random -e 7d
 
 - **A folder is one transfer.** It is packed into a single `.zip`. Several paths go in the same link.
 - **Large files keep several connections busy.** Files are split into 15 MiB blocks and uploaded in parallel.
-- **The network can drop.** Uploads retry and re-sign expired blocks. Downloads keep a `.part` file and resume.
+- **The network can drop.** Uploads and downloads wait up to 12 minutes, retry with backoff, and resume. A download keeps what it already wrote in a `.part` file.
 - **Password and expiry stick.** `none`, `random`, or a fixed password, and any duration up to 7 days. Saved for the next upload.
 - **Look before you save.** `wetransfer info` prints the title, size, and file list. Download is a separate command.
 - **A real screen when you are at the terminal.** Progress, a password prompt, and a choice when the file is already there.
@@ -70,7 +70,7 @@ wetransfer upload -p none -e 1d -t Notes a.txt b.txt
 | `-e` | Expiry, such as `12h`, `1d`, `7d`. Maximum is 7 days |
 | `-t` | Title |
 | `-m` | Message |
-| `-c` | Parallel connections (default 4) |
+| `-c` | Parallel connections (default 8) |
 | `-s` | Print only the link and password |
 | `--json` | Machine-readable result on stdout |
 | `-v` | Show API requests |
@@ -103,7 +103,7 @@ wetransfer info AbCdEfGhIjKl
 
 `LINK` can be a short URL (`https://we.tl/…`), a downloads URL (`https://wetransfer.com/downloads/…`), a handle (`t-AbCd…`), an `id/hash` pair, or a recipient link with `id/recipient/hash`.
 
-At a terminal, a missing password is asked for, and an existing file offers overwrite, keep both, rename, or cancel. Bytes already saved live in `name.part` until the download finishes. Ctrl+C leaves that partial file, and the next download of the same name continues from it. A dropped connection is retried with a fresh Range request.
+At a terminal, a missing password is asked for, and an existing file offers overwrite, keep both, rename, or cancel. Bytes already saved live in `name.part` until the download finishes. Ctrl+C leaves that partial file, and the next download of the same name continues from it. A dropped or stalled connection is retried with a fresh Range request.
 
 `info` prints the link, title, password flag, size, expiry, and the files. It does not download anything. A protected transfer still shows the summary; pass `-p` to see the list.
 
@@ -126,7 +126,7 @@ wetransfer down "$URL" -o - > file.bin       # single-file transfer
 **`up --json`**
 
 ```json
-{"url":"https://we.tl/t-…","password":"…","size":123,"expires_at":"…","files":[{"name":"a.txt","size":123}]}
+{"url":"https://we.tl/t-…","title":"…","password":"…","size":123,"expires_at":"…","files":[{"name":"a.txt","size":123}]}
 ```
 
 **`info --json`** — `files_hidden=true` when the password is missing
@@ -212,6 +212,15 @@ internal/cli        command and flag parsing
 internal/config     config.json and durations (7d, 12h…)
 internal/ui         progress, TTY, prompts
 internal/zipx       folder packing
+```
+
+## Releases
+
+A tag that starts with `v` builds the four archives and publishes them with `SHA256SUMS`.
+
+```bash
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 ## Disclaimer

@@ -57,7 +57,7 @@ func TestPasswordValue(t *testing.T) {
 		t.Errorf("fixed = %q %v %v", p, gen, err)
 	}
 	p, gen, err := (Config{Password: "random"}).PasswordValue()
-	if err != nil || !gen || len(p) != 12 {
+	if err != nil || !gen || len(p) != 16 {
 		t.Errorf("random = %q %v %v", p, gen, err)
 	}
 	if strings.ContainsAny(p, "0O1lI") {

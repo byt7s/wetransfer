@@ -15,9 +15,8 @@ import (
 	"wetransfer/internal/app"
 	"wetransfer/internal/config"
 	"wetransfer/internal/ui"
+	"wetransfer/internal/version"
 )
-
-const Version = "0.2.0"
 
 const usage = `wetransfer — send and receive files on WeTransfer from the terminal.
 
@@ -28,14 +27,14 @@ Usage:
   wetransfer config [flags]          Show or save the default password and expiry
   wetransfer version                 Print the build
 
-Aliases: up = u = upload, down = d = dl = download
+Aliases: up = u = upload, down = d = dl = download, config = defaults
 
 Upload flags:
   -p, --password VALUE   none, random, or a password      (default: config)
   -e, --expiry VALUE     12h, 1d, 7d — maximum 7 days     (default: config)
   -t, --title TEXT       Title shown on the download page
   -m, --message TEXT     Message shown with the link
-  -c, --connections N    Parallel connections             (default 4)
+  -c, --connections N    Parallel connections             (default 8)
   -s, --silent           Print only the link and password
       --json             Machine-readable result on stdout
   -v, --verbose          Show HTTP requests
@@ -93,10 +92,10 @@ func Run(ctx context.Context, argv []string) int {
 		return runDownload(ctx, rest)
 	case "info":
 		return runInfo(ctx, rest)
-	case "config":
+	case "config", "defaults":
 		return runConfig(rest)
-	case "version", "-v", "--version":
-		fmt.Printf("wetransfer %s\n", Version)
+	case "version", "-v", "-V", "-version", "--version":
+		version.Print()
 		return 0
 	case "help", "-h", "--help":
 		fmt.Fprint(os.Stdout, usage)
@@ -117,6 +116,7 @@ func fail(err error) int {
 
 type uploadJSON struct {
 	URL       string             `json:"url"`
+	Title     string             `json:"title,omitempty"`
 	Password  string             `json:"password,omitempty"`
 	Size      int64              `json:"size"`
 	ExpiresAt string             `json:"expires_at,omitempty"`
@@ -137,7 +137,7 @@ func runUpload(ctx context.Context, argv []string) int {
 		silent       bool
 		verbose      bool
 		jsonOut      bool
-		conns        = 4
+		conns        = 8
 		paths        []string
 	)
 
@@ -243,6 +243,7 @@ func runUpload(ctx context.Context, argv []string) int {
 	if jsonOut {
 		err := json.NewEncoder(os.Stdout).Encode(uploadJSON{
 			URL:       tr.ShortenedURL,
+			Title:     tr.DisplayName,
 			Password:  password,
 			Size:      tr.Size,
 			ExpiresAt: tr.ExpiresAt,
@@ -263,6 +264,9 @@ func runUpload(ctx context.Context, argv []string) int {
 	}
 
 	fmt.Fprintf(os.Stdout, "\nLink:      %s\n", tr.ShortenedURL)
+	if tr.DisplayName != "" {
+		fmt.Fprintf(os.Stdout, "Title:     %s\n", tr.DisplayName)
+	}
 	if password != "" {
 		fmt.Fprintf(os.Stdout, "Password:  %s\n", password)
 	}
