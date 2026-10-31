@@ -36,7 +36,7 @@ Upload flags:
   -t, --title TEXT       Title shown on the download page
   -m, --message TEXT     Message shown with the link
   -c, --connections N    Parallel connections             (default 4)
-  -s, --silent           No progress on stderr
+  -s, --silent           Print only the link and password
       --json             Machine-readable result on stdout
   -v, --verbose          Show HTTP requests
 

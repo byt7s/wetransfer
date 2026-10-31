@@ -71,7 +71,7 @@ wetransfer upload -p none -e 1d -t Notes a.txt b.txt
 | `-t` | Title |
 | `-m` | Message |
 | `-c` | Parallel connections (default 4) |
-| `-s` | No progress on stderr |
+| `-s` | Print only the link and password |
 | `--json` | Machine-readable result on stdout |
 | `-v` | Show API requests |
 
