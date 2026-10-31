@@ -7,17 +7,17 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/term"
 )
 
 // IsTerminal reports whether f is attached to a terminal.
 func IsTerminal(f *os.File) bool {
-	return isatty(f.Fd())
+	return term.IsTerminal(int(f.Fd()))
 }
 
 // Progress is a single aggregate bar written to stderr.
@@ -27,9 +27,15 @@ type Progress struct {
 	label   atomic.Value // string
 	out     io.Writer
 	enabled bool
+	screen  *Screen
 	start   time.Time
 	stop    chan struct{}
 	wg      sync.WaitGroup
+}
+
+// SetScreen draws this bar inside a full-screen layout instead of on one line.
+func (p *Progress) SetScreen(s *Screen) {
+	p.screen = s
 }
 
 func NewProgress(total int64, enabled bool, out io.Writer) *Progress {
@@ -122,9 +128,18 @@ func (p *Progress) render(final bool) {
 		speed = float64(done) / elapsed
 	}
 
-	line := fmt.Sprintf("\r\033[K[%s] %3.0f%%  %s/s", bar, pct*100, FormatBytes(int64(speed)))
+	var remain time.Duration
 	if p.total > 0 && speed > 0 && done < p.total {
-		remain := time.Duration(float64(p.total-done)/speed) * time.Second
+		remain = time.Duration(float64(p.total-done)/speed) * time.Second
+	}
+
+	if p.screen != nil && p.screen.Enabled() {
+		p.screen.SetProgress(label, done, p.total, speed, remain)
+		return
+	}
+
+	line := fmt.Sprintf("\r\033[K[%s] %3.0f%%  %s/s", bar, pct*100, FormatBytes(int64(speed)))
+	if remain > 0 {
 		line += "  ETA " + FormatClock(remain)
 	}
 	if label != "" {
@@ -184,51 +199,13 @@ func Confirm(prompt string, def bool) bool {
 	return line == "y" || line == "yes" || line == "s" || line == "sim"
 }
 
-// ReadPassword reads a line without echoing it. Falls back to plain input when
-// stty is unavailable.
+// ReadPassword reads a line without echoing it. It works on Unix and Windows.
 func ReadPassword(prompt string) (string, error) {
 	fmt.Fprint(os.Stderr, prompt)
-	cmd := exec.Command("stty", "-echo")
-	cmd.Stdin = os.Stdin
-	echoOff := cmd.Run() == nil
-
-	var once sync.Once
-	restore := func() {
-		if !echoOff {
-			return
-		}
-		once.Do(func() {
-			c := exec.Command("stty", "echo")
-			c.Stdin = os.Stdin
-			_ = c.Run()
-		})
-	}
-	defer restore()
-
-	// If the user presses Ctrl+C while typing, put the terminal back into a
-	// usable state before exiting. Otherwise the prompt would leave echo off.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
-	defer signal.Stop(sig)
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-sig:
-			restore()
-			fmt.Fprintln(os.Stderr)
-			os.Exit(130)
-		case <-done:
-		}
-	}()
-
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	close(done)
-	restore()
-	if echoOff {
-		fmt.Fprintln(os.Stderr)
-	}
-	if err != nil && line == "" {
+	b, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
 		return "", err
 	}
-	return strings.TrimRight(line, "\r\n"), nil
+	return string(b), nil
 }

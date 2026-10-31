@@ -80,8 +80,22 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 		opts.Concurrency = 8
 	}
 	progressOn := !opts.Silent && ui.IsTerminal(os.Stderr)
+	screen := ui.NewScreen(opts.Err, progressOn)
+	screen.SetSection("Upload")
+	if progressOn {
+		screen.Enter()
+		defer screen.Exit()
+	}
+	status := func(msg string) {
+		if progressOn {
+			screen.SetPhase(msg)
+		} else if !opts.Silent && opts.Err != nil {
+			fmt.Fprintln(opts.Err, msg)
+		}
+	}
+	status("Preparing files")
 
-	files, cleanup, err := collectFiles(ctx, opts)
+	files, cleanup, err := collectFiles(ctx, opts, status)
 	if err != nil {
 		return nil, err
 	}
@@ -108,9 +122,7 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 	if title == "" {
 		title = defaultTitle(files)
 	}
-	if !opts.Silent {
-		fmt.Fprintf(opts.Err, "Creating transfer (%d file%s, %s)…\n", len(files), plural(len(files)), ui.FormatBytes(total))
-	}
+	status(fmt.Sprintf("Creating transfer (%d file%s, %s)…", len(files), plural(len(files)), ui.FormatBytes(total)))
 	tr, err := client.Create(ctx, api.CreateOptions{
 		Files:        metas,
 		Message:      opts.Message,
@@ -141,7 +153,11 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 	// Split every file into 15 MiB blocks and hash each block. Splitting one
 	// large file lets several connections work on it at the same time.
 	if total > 0 {
+		if progressOn {
+			screen.SetPhase("Hashing")
+		}
 		bar := ui.NewProgress(total, progressOn, opts.Err)
+		bar.SetScreen(screen)
 		bar.SetLabel("hashing")
 		bar.Start()
 		err := parallel(ctx, opts.Concurrency, len(files), func(i int) error {
@@ -187,7 +203,11 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 	}
 
 	if len(jobs) > 0 {
+		if progressOn {
+			screen.SetPhase("Uploading")
+		}
 		up := ui.NewProgress(total, progressOn, opts.Err)
+		up.SetScreen(screen)
 		up.SetLabel(fmt.Sprintf("uploading 0/%d", len(jobs)))
 		up.Start()
 		var done int
@@ -196,7 +216,7 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 		notifyWait := func() {
 			waitOnce.Do(func() {
 				if progressOn {
-					up.SetLabel("connection lost — retrying…")
+					screen.SetPhase("Connection lost — retrying…")
 				} else if opts.Err != nil {
 					fmt.Fprintln(opts.Err, retry.WaitNotice)
 				}
@@ -217,8 +237,12 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 					watch.Mark()
 					mu.Lock()
 					done++
-					up.SetLabel(fmt.Sprintf("uploading %d/%d", done, len(jobs)))
+					label := fmt.Sprintf("uploading %d/%d", done, len(jobs))
 					mu.Unlock()
+					up.SetLabel(label)
+					if progressOn {
+						screen.SetPhase("Uploading")
+					}
 					return nil
 				}
 				// Bytes counted before a failed attempt are sent again on the
@@ -269,13 +293,12 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 		}
 		batch = append(batch, api.BatchItem{Path: f.name, BlockIDs: ids})
 	}
-	if !opts.Silent {
-		fmt.Fprintln(opts.Err, "Finishing upload…")
-	}
+	status("Finishing upload…")
 	if err := completeBatch(ctx, client, claims, tr.StormUploadToken, batch); err != nil {
 		return fail(fmt.Errorf("finalize blocks: %w", err))
 	}
 
+	status("Finalizing transfer…")
 	final, err := consolidate(ctx, client, tr.ID, tr.MutationToken)
 	if err != nil {
 		return fail(fmt.Errorf("finalize transfer: %w", err))
@@ -426,7 +449,7 @@ func waitDownloadable(ctx context.Context, client *api.Client, tr *api.Transfer)
 	return tr, nil
 }
 
-func collectFiles(ctx context.Context, opts UploadOptions) ([]uploadFile, func(), error) {
+func collectFiles(ctx context.Context, opts UploadOptions, status func(string)) ([]uploadFile, func(), error) {
 	var files []uploadFile
 	var temps []string
 	cleanup := func() {
@@ -452,9 +475,7 @@ func collectFiles(ctx context.Context, opts UploadOptions) ([]uploadFile, func()
 			}
 			tmpPath := tmp.Name()
 			_ = tmp.Close()
-			if !opts.Silent {
-				fmt.Fprintf(opts.Err, "Packing %s…\n", filepath.Base(filepath.Clean(p)))
-			}
+			status(fmt.Sprintf("Packing %s…", filepath.Base(filepath.Clean(p))))
 			var packed int
 			res, err := zipx.Dir(ctx, p, tmpPath, func() { packed++ })
 			if err != nil {
@@ -467,9 +488,7 @@ func collectFiles(ctx context.Context, opts UploadOptions) ([]uploadFile, func()
 				cleanup()
 				return nil, nil, fmt.Errorf("duplicate file name %q (%s and %s); rename one of them", name, prev, p)
 			}
-			if !opts.Silent {
-				fmt.Fprintf(opts.Err, "Packed %s (%d files, %s)\n", name, res.Files, ui.FormatBytes(res.Size))
-			}
+			status(fmt.Sprintf("Packed %s (%d files, %s)", name, res.Files, ui.FormatBytes(res.Size)))
 			files = append(files, uploadFile{path: res.Path, name: name, size: res.Size, packed: true})
 			seen[name] = p
 		case info.Mode().IsRegular():

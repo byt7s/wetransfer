@@ -279,7 +279,15 @@ func Download(ctx context.Context, opts DownloadOptions) ([]DownloadedFile, erro
 	}
 
 	progressOn := !opts.Silent && total > 0 && ui.IsTerminal(os.Stderr)
+	screen := ui.NewScreen(opts.Err, progressOn)
+	screen.SetSection("Download")
+	screen.SetPhase("Downloading")
+	if progressOn {
+		screen.Enter()
+		defer screen.Exit()
+	}
 	bar := ui.NewProgress(total, progressOn, opts.Err)
+	bar.SetScreen(screen)
 	bar.SetLabel(fmt.Sprintf("downloading 0/%d", len(jobs)))
 	bar.Start()
 
@@ -290,7 +298,7 @@ func Download(ctx context.Context, opts DownloadOptions) ([]DownloadedFile, erro
 	onWait := func() {
 		waitOnce.Do(func() {
 			if progressOn {
-				bar.SetLabel("connection lost — retrying…")
+				screen.SetPhase("Connection lost — retrying…")
 			} else if opts.Err != nil {
 				fmt.Fprintln(opts.Err, retry.WaitNotice)
 			}
@@ -304,12 +312,20 @@ func Download(ctx context.Context, opts DownloadOptions) ([]DownloadedFile, erro
 		results[i] = DownloadedFile{Name: filepath.Base(j.dst), Path: j.dst, Size: j.item.Size}
 		mu.Lock()
 		done++
-		bar.SetLabel(fmt.Sprintf("downloading %d/%d", done, len(jobs)))
+		label := fmt.Sprintf("downloading %d/%d", done, len(jobs))
 		mu.Unlock()
+		bar.SetLabel(label)
+		if progressOn {
+			screen.SetPhase("Downloading")
+		}
 		return nil
 	})
 	bar.Stop()
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			screen.Exit()
+			maybeDeleteParts(jobs, opts)
+		}
 		return nil, err
 	}
 	return results, nil
@@ -354,6 +370,40 @@ func streamToStdout(ctx context.Context, client *api.Client, ref *Ref, pwd strin
 type downloadJob struct {
 	item api.FileItem
 	dst  string
+}
+
+// maybeDeleteParts asks before throwing away resumable data after Ctrl+C.
+func maybeDeleteParts(jobs []downloadJob, opts DownloadOptions) {
+	var parts []string
+	for _, j := range jobs {
+		p := j.dst + ".part"
+		if _, err := os.Stat(p); err == nil {
+			parts = append(parts, p)
+		}
+	}
+	if len(parts) == 0 {
+		return
+	}
+	errOut := opts.Err
+	if errOut == nil {
+		errOut = io.Discard
+	}
+	if !ui.IsTerminal(os.Stdin) {
+		fmt.Fprintln(errOut, "Partial files kept. Run the same command to resume.")
+		return
+	}
+	word := "files"
+	if len(parts) == 1 {
+		word = "file"
+	}
+	if ui.Confirm(fmt.Sprintf("Delete %d partial %s? [y/N] ", len(parts), word), false) {
+		for _, p := range parts {
+			_ = os.Remove(p)
+		}
+		fmt.Fprintln(errOut, "Partial files deleted.")
+		return
+	}
+	fmt.Fprintln(errOut, "Partial files kept. Run the same command to resume.")
 }
 
 func signLink(ctx context.Context, client *api.Client, ref *Ref, pwd string, item api.FileItem) (string, error) {
