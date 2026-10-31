@@ -10,14 +10,12 @@ import (
 )
 
 func Enable() {
-	out := windows.Handle(os.Stdout.Fd())
 	var mode uint32
-	if windows.GetConsoleMode(out, &mode) == nil {
-		_ = windows.SetConsoleMode(out, mode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
-	}
-	in := windows.Handle(os.Stdin.Fd())
-	if windows.GetConsoleMode(in, &mode) == nil {
-		_ = windows.SetConsoleMode(in, mode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+	for _, f := range []*os.File{os.Stdout, os.Stderr, os.Stdin} {
+		h := windows.Handle(f.Fd())
+		if windows.GetConsoleMode(h, &mode) == nil {
+			_ = windows.SetConsoleMode(h, mode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+		}
 	}
 	_ = windows.SetConsoleOutputCP(65001)
 	_ = windows.SetConsoleCP(65001)
