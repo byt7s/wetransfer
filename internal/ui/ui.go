@@ -22,7 +22,7 @@ func IsTerminal(f *os.File) bool {
 
 // Progress is a single aggregate bar written to stderr.
 type Progress struct {
-	total   int64
+	total   atomic.Int64
 	done    atomic.Int64
 	label   atomic.Value // string
 	out     io.Writer
@@ -39,9 +39,16 @@ func (p *Progress) SetScreen(s *Screen) {
 }
 
 func NewProgress(total int64, enabled bool, out io.Writer) *Progress {
-	p := &Progress{total: total, out: out, enabled: enabled}
+	p := &Progress{out: out, enabled: enabled}
+	p.total.Store(total)
 	p.label.Store("")
 	return p
+}
+
+// SetTotal sets the byte total once it is known, so a bar can be created
+// before a size scan finishes.
+func (p *Progress) SetTotal(total int64) {
+	p.total.Store(total)
 }
 
 func (p *Progress) Start() {
@@ -109,12 +116,13 @@ func (p *Progress) Stop() {
 
 func (p *Progress) render(final bool) {
 	done := p.done.Load()
+	total := p.total.Load()
 	label, _ := p.label.Load().(string)
 
 	const width = 24
 	var pct float64
-	if p.total > 0 {
-		pct = float64(done) / float64(p.total)
+	if total > 0 {
+		pct = float64(done) / float64(total)
 		if pct > 1 {
 			pct = 1
 		}
@@ -129,12 +137,12 @@ func (p *Progress) render(final bool) {
 	}
 
 	var remain time.Duration
-	if p.total > 0 && speed > 0 && done < p.total {
-		remain = time.Duration(float64(p.total-done)/speed) * time.Second
+	if total > 0 && speed > 0 && done < total {
+		remain = time.Duration(float64(total-done)/speed) * time.Second
 	}
 
 	if p.screen != nil && p.screen.Enabled() {
-		p.screen.SetProgress(label, done, p.total, speed, remain)
+		p.screen.SetProgress(label, done, total, speed, remain)
 		return
 	}
 

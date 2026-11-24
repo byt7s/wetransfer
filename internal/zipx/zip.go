@@ -17,9 +17,16 @@ type Result struct {
 	Files int
 }
 
+// Counter receives the source byte total and how many bytes have been
+// archived so far. *ui.Progress satisfies it.
+type Counter interface {
+	SetTotal(total int64)
+	Add(n int64)
+}
+
 // Dir zips srcDir into dstPath. The archive contains the directory's contents
-// at its root. onFile is called after each entry is written.
-func Dir(ctx context.Context, srcDir, dstPath string, onFile func()) (*Result, error) {
+// at its root.
+func Dir(ctx context.Context, srcDir, dstPath string, progress Counter) (*Result, error) {
 	type entry struct {
 		path  string
 		rel   string
@@ -75,6 +82,16 @@ func Dir(ctx context.Context, srcDir, dstPath string, onFile func()) (*Result, e
 
 	zw := zip.NewWriter(f)
 
+	var total int64
+	for _, e := range entries {
+		if !e.isDir {
+			total += e.info.Size()
+		}
+	}
+	if progress != nil {
+		progress.SetTotal(total)
+	}
+
 	files := 0
 	for _, e := range entries {
 		if err := ctx.Err(); err != nil {
@@ -116,8 +133,27 @@ func Dir(ctx context.Context, srcDir, dstPath string, onFile func()) (*Result, e
 			_ = zw.Close()
 			return nil, err
 		}
-		_, copyErr := io.Copy(w, src)
-		closeErr := src.Close()
+		buf := make([]byte, 256*1024)
+		var copyErr, closeErr error
+		for {
+			n, readErr := src.Read(buf)
+			if n > 0 {
+				if _, err := w.Write(buf[:n]); err != nil {
+					copyErr = err
+					break
+				}
+				if progress != nil {
+					progress.Add(int64(n))
+				}
+			}
+			if readErr != nil {
+				if readErr != io.EOF {
+					copyErr = readErr
+				}
+				break
+			}
+		}
+		closeErr = src.Close()
 		if copyErr != nil {
 			_ = zw.Close()
 			return nil, copyErr
@@ -127,9 +163,6 @@ func Dir(ctx context.Context, srcDir, dstPath string, onFile func()) (*Result, e
 			return nil, closeErr
 		}
 		files++
-		if onFile != nil {
-			onFile()
-		}
 	}
 	if err := zw.Close(); err != nil {
 		return nil, err

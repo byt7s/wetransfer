@@ -100,11 +100,14 @@ func Upload(ctx context.Context, opts UploadOptions) (*UploadResult, error) {
 	}
 	status("Preparing files")
 
-	files, cleanup, err := collectFiles(ctx, opts, status)
+	files, cleanup, err := collectFiles(ctx, opts, screen, status)
 	if err != nil {
 		return nil, err
 	}
 	defer cleanup()
+	if progressOn {
+		screen.ClearProgress()
+	}
 
 	var total int64
 	metas := make([]api.FileMeta, 0, len(files))
@@ -479,7 +482,7 @@ func waitDownloadable(ctx context.Context, client *api.Client, tr *api.Transfer)
 	return tr, nil
 }
 
-func collectFiles(ctx context.Context, opts UploadOptions, status func(string)) ([]uploadFile, func(), error) {
+func collectFiles(ctx context.Context, opts UploadOptions, screen *ui.Screen, status func(string)) ([]uploadFile, func(), error) {
 	var files []uploadFile
 	var temps []string
 	cleanup := func() {
@@ -506,8 +509,11 @@ func collectFiles(ctx context.Context, opts UploadOptions, status func(string)) 
 			tmpPath := tmp.Name()
 			_ = tmp.Close()
 			status(fmt.Sprintf("Packing %s…", filepath.Base(filepath.Clean(p))))
-			var packed int
-			res, err := zipx.Dir(ctx, p, tmpPath, func() { packed++ })
+			bar := ui.NewProgress(0, !opts.Silent, opts.Err)
+			bar.SetScreen(screen)
+			bar.Start()
+			res, err := zipx.Dir(ctx, p, tmpPath, bar)
+			bar.Stop()
 			if err != nil {
 				_ = os.Remove(tmpPath)
 				cleanup()
